@@ -5,6 +5,7 @@ PyVISA-py Changelog
 ------------------
 
 - fix GPIB commands used in control_ren implementation PR #276
+- fix writing to serial resources PR #277
 - fix return value of USB close method PR #265
 - fix pyvisa version contraint PR #268
 
