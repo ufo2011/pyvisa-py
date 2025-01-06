@@ -2,10 +2,11 @@
 """Highlevel wrapper of the VISA Library.
 
 
-:copyright: 2014-2020 by PyVISA-py Authors, see AUTHORS for more details.
+:copyright: 2014-2024 by PyVISA-py Authors, see AUTHORS for more details.
 :license: MIT, see LICENSE for more details.
 
 """
+
 import random
 from collections import OrderedDict
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
@@ -13,10 +14,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
 from pyvisa import constants, highlevel, rname
 from pyvisa.constants import StatusCode
 from pyvisa.typing import VISAEventContext, VISARMSession, VISASession
-from pyvisa.util import LibraryPath
+from pyvisa.util import DebugInfo, LibraryPath
 
 from . import sessions
-from .common import logger
+from .common import LOGGER
 
 
 class PyVisaLibrary(highlevel.VisaLibraryBase):
@@ -44,30 +45,30 @@ class PyVisaLibrary(highlevel.VisaLibraryBase):
     try:
         from .serial import SerialSession
 
-        logger.debug("SerialSession was correctly imported.")
+        LOGGER.debug("SerialSession was correctly imported.")
     except Exception as e:
-        logger.debug("SerialSession was not imported %s." % e)
+        LOGGER.debug("SerialSession was not imported %s." % e)
 
     try:
         from .usb import USBRawSession, USBSession
 
-        logger.debug("USBSession and USBRawSession were correctly imported.")
+        LOGGER.debug("USBSession and USBRawSession were correctly imported.")
     except Exception as e:
-        logger.debug("USBSession and USBRawSession were not imported %s." % e)
+        LOGGER.debug("USBSession and USBRawSession were not imported %s." % e)
 
     try:
         from .tcpip import TCPIPInstrSession, TCPIPSocketSession
 
-        logger.debug("TCPIPSession was correctly imported.")
+        LOGGER.debug("TCPIPSession was correctly imported.")
     except Exception as e:
-        logger.debug("TCPIPSession was not imported %s." % e)
+        LOGGER.debug("TCPIPSession was not imported %s." % e)
 
     try:
         from .gpib import GPIBSession
 
-        logger.debug("GPIBSession was correctly imported.")
+        LOGGER.debug("GPIBSession was correctly imported.")
     except Exception as e:
-        logger.debug("GPIBSession was not imported %s." % e)
+        LOGGER.debug("GPIBSession was not imported %s." % e)
 
     @staticmethod
     def get_library_paths() -> Iterable[LibraryPath]:
@@ -75,7 +76,7 @@ class PyVisaLibrary(highlevel.VisaLibraryBase):
         return (LibraryPath("py"),)
 
     @staticmethod
-    def get_debug_info() -> Dict[str, Union[str, List[str], Dict[str, str]]]:
+    def get_debug_info() -> DebugInfo:
         """Return a list of lines with backend info."""
         from . import __version__
 
@@ -116,7 +117,7 @@ class PyVisaLibrary(highlevel.VisaLibraryBase):
         session: VISARMSession,
         resource_name: str,
         access_mode: constants.AccessModes = constants.AccessModes.no_lock,
-        open_timeout: int = constants.VI_TMO_IMMEDIATE,
+        open_timeout: Optional[int] = constants.VI_TMO_IMMEDIATE,
     ) -> Tuple[VISASession, StatusCode]:
         """Opens a session to the specified resource.
 
@@ -145,7 +146,7 @@ class PyVisaLibrary(highlevel.VisaLibraryBase):
 
         """
         try:
-            open_timeout = int(open_timeout)
+            open_timeout = None if open_timeout is None else int(open_timeout)
         except ValueError:
             raise ValueError(
                 "open_timeout (%r) must be an integer (or compatible type)"
@@ -164,7 +165,10 @@ class PyVisaLibrary(highlevel.VisaLibraryBase):
             parsed.interface_type_const, parsed.resource_class
         )
 
-        sess = cls(session, resource_name, parsed, open_timeout)
+        try:
+            sess = cls(session, resource_name, parsed, open_timeout)
+        except sessions.OpenError as e:
+            return VISASession(0), self.handle_return_value(None, e.error_code)
 
         return self._register(sess), StatusCode.success
 
@@ -752,7 +756,7 @@ class PyVisaLibrary(highlevel.VisaLibraryBase):
             Return value of the library call.
 
         """
-        pass
+        return StatusCode.error_nonimplemented_operation
 
     def discard_events(
         self,
@@ -779,4 +783,4 @@ class PyVisaLibrary(highlevel.VisaLibraryBase):
             Return value of the library call.
 
         """
-        pass
+        return StatusCode.error_nonimplemented_operation

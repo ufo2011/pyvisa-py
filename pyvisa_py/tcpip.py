@@ -2,22 +2,44 @@
 """TCPIP Session implementation using Python Standard library.
 
 
-:copyright: 2014-2020 by PyVISA-py Authors, see AUTHORS for more details.
+:copyright: 2014-2024 by PyVISA-py Authors, see AUTHORS for more details.
 :license: MIT, see LICENSE for more details.
 
 """
+
+import ipaddress
 import random
 import select
 import socket
 import time
-from typing import Any, List, Optional, Tuple
+import warnings
+from typing import Any, Dict, List, Optional, Tuple, Type, cast
 
 from pyvisa import attributes, constants, errors, rname
-from pyvisa.constants import ResourceAttribute, StatusCode
+from pyvisa.constants import BufferOperation, ResourceAttribute, StatusCode
 
-from . import common
-from .protocols import rpc, vxi11
-from .sessions import Session, UnknownAttribute
+from .common import LOGGER, int_to_byte
+from .protocols import hislip, rpc, vxi11
+from .sessions import OpenError, Session, UnknownAttribute, VISARMSession
+
+# Let psutil be optional dependency
+try:
+    import psutil  # type: ignore
+except ImportError:
+    psutil = None
+
+# Let zeroconf be optional dependency
+try:
+    import zeroconf  # type: ignore
+except ImportError:
+    zeroconf = None  # type: ignore
+
+# Let pyvicp be an optional dependency
+try:
+    import pyvicp  # type: ignore
+except ImportError:
+    pyvicp = None  # type: ignore
+
 
 # Conversion between VXI11 error codes and VISA status
 # TODO this is so far a best guess, in particular 6 and 29 are likely wrong
@@ -41,7 +63,348 @@ VXI11_ERRORS_TO_VISA = {
 
 @Session.register(constants.InterfaceType.tcpip, "INSTR")
 class TCPIPInstrSession(Session):
+    """A class to dispatch to VXI11 or HiSLIP, based on the protocol."""
+
+    def __new__(
+        cls,
+        resource_manager_session: VISARMSession,
+        resource_name: str,
+        parsed=None,
+        open_timeout: Optional[int] = None,
+    ):
+        newcls: Type
+
+        if parsed is None:
+            parsed = rname.parse_resource_name(resource_name)
+
+        if parsed.lan_device_name.lower().startswith("hislip"):
+            newcls = TCPIPInstrHiSLIP
+
+        else:
+            newcls = TCPIPInstrVxi11
+
+        return newcls(resource_manager_session, resource_name, parsed, open_timeout)
+
+    @staticmethod
+    def list_resources(wait_time=1.0) -> List[str]:
+        return TCPIPInstrVxi11.list_resources() + TCPIPInstrHiSLIP.list_resources()
+
+    @classmethod
+    def get_low_level_info(cls) -> str:
+        vxi11 = "ok" if psutil is not None else "partial (psutil not installed)"
+        hislip = "ok" if zeroconf is not None else "disabled (zeroconf not installed)"
+        return (
+            "\n         Resource discovery:"
+            f"\n         - VXI-11: {vxi11}"
+            f"\n         - hislip: {hislip}"
+        )
+
+
+class TCPIPInstrHiSLIP(Session):
+    """A TCPIP Session built on socket standard library using HiSLIP protocol."""
+
+    # we don't decorate this class with Session.register() because we don't
+    # want it to be registered in the _session_classes array, but we still
+    # need to define session_type to make the set_attribute machinery work.
+    session_type = (constants.InterfaceType.tcpip, "INSTR")
+
+    # Override parsed to take into account the fact that this class is only used
+    # for a specific kind of resource
+    parsed: rname.TCPIPInstr
+
+    @staticmethod
+    def list_resources(wait_time=1.0) -> List[str]:
+        resources = []
+        try:
+            for host in get_services("_hislip._tcp.local.", wait_time=wait_time):
+                resources.append(f"TCPIP::{host}::hislip0,4880::INSTR")
+        except NotImplementedError:
+            warnings.warn(
+                "TCPIP::hislip resource discovery requires the zeroconf package "
+                "to be installed... try 'pip install zeroconf'",
+                UserWarning,
+            )
+        return sorted(resources)
+
+    def after_parsing(self) -> None:
+        # TODO: board_number not handled
+
+        if "," in self.parsed.lan_device_name:
+            sub_address, port_str = self.parsed.lan_device_name.split(",")
+            port = int(port_str)
+        else:
+            sub_address = self.parsed.lan_device_name
+            port = 4880
+
+        try:
+            self.interface = hislip.Instrument(
+                self.parsed.host_address,
+                open_timeout=(
+                    self.open_timeout * 1000.0
+                    if self.open_timeout is not None
+                    else self.open_timeout
+                ),
+                timeout=self.timeout,
+                port=port,
+                sub_address=sub_address,
+            )
+        except Exception as e:
+            LOGGER.exception(
+                f"Failed to open HiSLIP connection to {self.parsed.host_address} "
+                f"on port {port} with lan device name {sub_address}"
+            )
+            raise OpenError() from e
+
+        # initialize the constant attributes
+        self.attrs[ResourceAttribute.dma_allow_enabled] = constants.VI_FALSE
+        self.attrs[ResourceAttribute.file_append_enabled] = constants.VI_FALSE
+        self.attrs[ResourceAttribute.interface_instrument_name] = "TCPIP0 (HiSLIP)"
+        self.attrs[ResourceAttribute.interface_number] = 0
+        self.attrs[ResourceAttribute.io_prot] = constants.VI_PROT_NORMAL
+        self.attrs[ResourceAttribute.read_buffer_operation_mode] = (
+            constants.VI_FLUSH_DISABLE
+        )
+        self.attrs[ResourceAttribute.resource_lock_state] = constants.VI_NO_LOCK
+        self.attrs[ResourceAttribute.send_end_enabled] = constants.VI_TRUE
+        self.attrs[ResourceAttribute.suppress_end_enabled] = constants.VI_FALSE
+        self.attrs[ResourceAttribute.tcpip_address] = self.parsed.host_address
+        self.attrs[ResourceAttribute.tcpip_device_name] = self.parsed.lan_device_name
+        self.attrs[ResourceAttribute.tcpip_hislip_overlap_enable] = constants.VI_FALSE
+        self.attrs[ResourceAttribute.tcpip_hislip_version] = 0x0010_0000
+        self.attrs[ResourceAttribute.tcpip_hostname] = self.parsed.host_address
+        self.attrs[ResourceAttribute.tcpip_is_hislip] = constants.VI_TRUE
+        self.attrs[ResourceAttribute.tcpip_nodelay] = constants.VI_TRUE
+        self.attrs[ResourceAttribute.tcpip_port] = port
+        self.attrs[ResourceAttribute.termchar] = ord("\n")
+        self.attrs[ResourceAttribute.termchar_enabled] = constants.VI_FALSE
+        self.attrs[ResourceAttribute.write_buffer_operation_mode] = (
+            constants.VI_FLUSH_WHEN_FULL
+        )
+
+        # configure the variable attributes
+        self.attrs[ResourceAttribute.tcpip_hislip_max_message_kb] = (
+            self.get_max_message_kb,
+            self.set_max_message_kb,
+        )
+        self.attrs[ResourceAttribute.tcpip_keepalive] = (
+            self.get_keepalive,
+            self.set_keepalive,
+        )
+
+        # TODO: additional attributes (someday)
+        # self.attrs[ResourceAttribute.manufacturer_id] = 16711
+        # self.attrs[ResourceAttribute.max_queue_length] = 50
+        # self.attrs[ResourceAttribute.read_buffer_size] = 4096
+        # self.attrs[ResourceAttribute.resource_impl_version] = 0x0050_0c01
+        # self.attrs[ResourceAttribute.resource_manufacturer_id] = 4015
+        # self.attrs[ResourceAttribute.resource_manufacturer_name] = 'Rohde & Schwarz GmbH'
+        # self.attrs[ResourceAttribute.resource_spec_version] = 0x0050_0800
+        # self.attrs[ResourceAttribute.user_data] = 0
+        # self.attrs[ResourceAttribute.write_buffer_size] = 4096
+
+    def get_max_message_kb(
+        self, attribute: ResourceAttribute
+    ) -> Tuple[int, StatusCode]:
+        """Get the maximum HiSLIP message size in kilobytes."""
+        max_msg_size_kb = int(round(self.interface.max_msg_size / 1024))
+        return max_msg_size_kb, StatusCode.success
+
+    def set_max_message_kb(
+        self, attribute: ResourceAttribute, size_kb: int
+    ) -> StatusCode:
+        """Set the maximum HiSLIP message size in kilobytes."""
+        if size_kb < 1:
+            raise ValueError("size must be >= 1 kilobyte")
+
+        if size_kb > 0xFFFF_FFFF:
+            raise ValueError("size exceeds the range in the VISA spec")
+
+        self.interface.max_msg_size = int(round(size_kb * 1024))
+        return StatusCode.success
+
+    def get_keepalive(self, attribute: ResourceAttribute) -> Tuple[bool, StatusCode]:
+        """Is TCP keepalive enabled for the resource."""
+        return self.interface.keepalive, StatusCode.success
+
+    def set_keepalive(
+        self, attribute: ResourceAttribute, keepalive: bool
+    ) -> StatusCode:
+        """Turns TCP keepalive on/off for this connection."""
+        self.interface.keepalive = keepalive
+        return StatusCode.success
+
+    def close(self) -> StatusCode:
+        self.interface.close()
+        self.interface = None
+        return StatusCode.success
+
+    def _set_timeout(self, attribute: ResourceAttribute, value: int) -> StatusCode:
+        status = super()._set_timeout(attribute, value)
+        if hasattr(self.interface, "timeout"):
+            self.interface.timeout = 1e-3 * value
+
+        return status
+
+    def read(self, count: int) -> Tuple[bytes, StatusCode]:
+        """Reads data from device or interface synchronously.
+
+        Corresponds to viRead function of the VISA library.
+
+         Parameters
+        -----------
+        count : int
+            Number of bytes to be read.
+
+        Returns
+        -------
+        bytes
+            Data read from the device
+        StatusCode
+            Return value of the library call.
+
+        """
+        try:
+            data = self.interface.receive(count)
+            status = (
+                StatusCode.success_termination_character_read
+                if self.interface._rmt
+                else StatusCode.success_max_count_read
+                if len(data) >= count
+                else StatusCode.success
+            )
+
+        except socket.timeout:
+            data, status = b"", StatusCode.error_timeout
+
+        return data, status
+
+    def write(self, data: bytes) -> Tuple[int, StatusCode]:
+        """Writes data to device or interface synchronously.
+
+        Corresponds to viWrite function of the VISA library.
+
+        Parameters
+        ----------
+        data : bytes
+            Data to be written.
+
+        Returns
+        -------
+        int
+            Number of bytes actually transferred
+        StatusCode
+            Return value of the library call.
+
+        """
+        self.interface.send(data)
+
+        return len(data), StatusCode.success
+
+    def clear(self) -> StatusCode:
+        """Clears a device.
+
+        Corresponds to viClear function of the VISA library.
+
+        """
+        self.interface.device_clear()
+
+        return StatusCode.success
+
+    def read_stb(self) -> Tuple[int, StatusCode]:
+        """Reads a status byte of the service request.
+
+        Corresponds to viReadSTB function of the VISA library.
+
+        Returns
+        -------
+        int
+            Service request status byte
+        StatusCode
+            Return value of the library call.
+
+        """
+
+        interface = cast(hislip.Instrument, self.interface)
+        # According to IVI-6.1 Rev.2 status query corresponds to viReadSTB.
+        stb = interface.async_status_query()
+        errorcode = StatusCode.success
+
+        return stb, errorcode
+
+    def _get_attribute(self, attribute: ResourceAttribute) -> Tuple[Any, StatusCode]:
+        """Get the value for a given VISA attribute for this session.
+
+        Use to implement custom logic for attributes.
+
+        Parameters
+        ----------
+        attribute : ResourceAttribute
+            Attribute for which the state query is made
+
+        Returns
+        -------
+        Any
+            State of the queried attribute for a specified resource
+        StatusCode
+            Return value of the library call.
+
+        """
+        raise UnknownAttribute(attribute)
+
+    def _set_attribute(
+        self, attribute: ResourceAttribute, attribute_state: Any
+    ) -> StatusCode:
+        """Sets the state of an attribute.
+
+        Corresponds to viSetAttribute function of the VISA library.
+
+        Parameters
+        ----------
+        attribute : constants.ResourceAttribute
+            Attribute for which the state is to be modified. (Attributes.*)
+        attribute_state : Any
+            The state of the attribute to be set for the specified object.
+
+        Returns
+        -------
+        StatusCode
+            Return value of the library call.
+
+        """
+        raise UnknownAttribute(attribute)
+
+
+class Vxi11CoreClient(vxi11.CoreClient):
+    """
+    make a connection using vxi11 protocol, optionally allowing the port number
+    to be specified.  although in general the port number must be obtained by
+    querying the portmapper, in practice any given instrument typically always
+    uses the same port number.  this allows you to open that port on a firewall
+    or set up an ssh tunnel to that port.
+
+    """
+
+    def __init__(
+        self, host: str, port: Optional[int], open_timeout: Optional[int] = 5000
+    ) -> None:
+        self.packer = vxi11.Vxi11Packer()
+        self.unpacker = vxi11.Vxi11Unpacker(b"")
+        prog, vers = vxi11.DEVICE_CORE_PROG, vxi11.DEVICE_CORE_VERS
+
+        if port is None:
+            rpc.TCPClient.__init__(self, host, prog, vers, open_timeout)
+        else:
+            # bypass the portmapper lookup and use the specified port instead
+            rpc.RawTCPClient.__init__(self, host, prog, vers, port, open_timeout)
+
+
+class TCPIPInstrVxi11(Session):
     """A TCPIP Session built on socket standard library using VXI-11 protocol."""
+
+    # we don't decorate this class with Session.register() because we don't
+    # want it to be registered in the _session_classes array, but we still
+    # need to define session_type to make the set_attribute machinery work.
+    session_type = (constants.InterfaceType.tcpip, "INSTR")
 
     #: Maximum size of a chunk of data in bytes.
     max_recv_size: int
@@ -64,19 +427,75 @@ class TCPIPInstrSession(Session):
 
     @staticmethod
     def list_resources() -> List[str]:
-        # TODO: is there a way to get this?
-        return []
+        broadcast_addr = []
+        if psutil is not None:
+            # Get broadcast address for each interface
+            for interface, snics in psutil.net_if_addrs().items():
+                for snic in snics:
+                    if snic.family is socket.AF_INET and snic.netmask is not None:
+                        addr = snic.address
+                        mask = snic.netmask
+                        network = ipaddress.IPv4Network(addr + "/" + mask, strict=False)
+                        broadcast_addr.append(str(network.broadcast_address))
+        else:
+            # If psutil unavailable fallback to default interface
+            broadcast_addr.append("255.255.255.255")
+            warnings.warn(
+                "TCPIP:instr resource discovery is limited to the default interface."
+                "Install psutil: pip install psutil if you want to scan all interfaces.",
+                UserWarning,
+            )
+
+        pmap_list = [rpc.BroadcastUDPPortMapperClient(ip) for ip in broadcast_addr]
+        for pmap in list(pmap_list):
+            pmap.set_timeout(0)
+            try:
+                pmap.send_port(
+                    (vxi11.DEVICE_CORE_PROG, vxi11.DEVICE_CORE_VERS, rpc.IPPROTO_TCP, 0)
+                )
+            except rpc.RPCError:
+                pmap_list.remove(pmap)
+
+        # Timeout for responses
+        time.sleep(1)
+
+        all_res = []
+        for pmap in pmap_list:
+            try:
+                resp = pmap.recv_port(
+                    (vxi11.DEVICE_CORE_PROG, vxi11.DEVICE_CORE_VERS, rpc.IPPROTO_TCP, 0)
+                )
+            except rpc.RPCError:
+                pass
+            else:
+                res = [r[1][0] for r in resp if r[0] > 0]
+                res = sorted(
+                    res, key=lambda ip: tuple(int(part) for part in ip.split("."))
+                )
+                # TODO: Detect GPIB over TCPIP
+                res = ["TCPIP::{}::INSTR".format(host) for host in res]
+                all_res.extend(res)
+
+        return all_res
 
     def after_parsing(self) -> None:
         # TODO: board_number not handled
-        # vx11 expect all timeouts to be expressed in ms and should be integers
-        try:
-            self.interface = vxi11.CoreClient(
-                self.parsed.host_address, self.open_timeout
-            )
-        except rpc.RPCError:
-            raise errors.VisaIOError(constants.VI_ERROR_RSRC_NFOUND)
 
+        host_address = self.parsed.host_address
+        if "," in host_address:
+            host_address, port_str = host_address.split(",")
+            port = int(port_str)
+        else:
+            port = None
+        try:
+            self.interface = Vxi11CoreClient(host_address, port, self.open_timeout)
+        except rpc.RPCError:
+            LOGGER.exception(
+                f"Failed to open VX11 connection to {host_address} on port {port}"
+            )
+            raise OpenError()
+
+        # vxi11 expect all timeouts to be expressed in ms and should be integers
         self.lock_timeout = 10000
         self.client_id = random.getrandbits(31)
         self.keepalive = False
@@ -89,8 +508,12 @@ class TCPIPInstrSession(Session):
             raise Exception("error creating link: %d" % error)
 
         self.link = link
-        self.max_recv_size = min(max_recv_size, 2 ** 30)  # 1GB
+        self.max_recv_size = min(max_recv_size, 2**30)  # 1GB
 
+        self.attrs[ResourceAttribute.tcpip_is_hislip] = False
+        self.attrs[ResourceAttribute.tcpip_address] = self.parsed.host_address
+        self.attrs[ResourceAttribute.tcpip_hostname] = ""
+        self.attrs[ResourceAttribute.tcpip_device_name] = self.parsed.lan_device_name
         for name in ("SEND_END_EN", "TERMCHAR", "TERMCHAR_EN"):
             attribute = getattr(constants, "VI_ATTR_" + name)
             self.attrs[attribute] = attributes.AttributesByID[attribute].default
@@ -99,7 +522,7 @@ class TCPIPInstrSession(Session):
         try:
             self.interface.destroy_link(self.link)
         except (errors.VisaIOError, socket.error, rpc.RPCError) as e:
-            print("Error closing VISA link: {}".format(e))
+            LOGGER.error("Error closing VISA link: {}".format(e))
 
         self.interface.close()
         self.link = 0
@@ -188,16 +611,13 @@ class TCPIPInstrSession(Session):
             Return value of the library call.
 
         """
-        send_end, _ = self.get_attribute(ResourceAttribute.send_end_enabled)
-        chunk_size = 1024
-
         try:
             flags = 0
             num = len(data)
             offset = 0
 
             while num > 0:
-                if num <= chunk_size:
+                if num <= self.max_recv_size:
                     flags |= vxi11.OP_FLAG_END
 
                 block = data[offset : offset + self.max_recv_size]
@@ -238,23 +658,9 @@ class TCPIPInstrSession(Session):
             Return value of the library call.
 
         """
-        if attribute == constants.VI_ATTR_TCPIP_ADDR:
-            return self.parsed.host_address, StatusCode.success
-
-        elif attribute == constants.VI_ATTR_TCPIP_DEVICE_NAME:
-            raise NotImplementedError
-
-        elif attribute == constants.VI_ATTR_TCPIP_HOSTNAME:
-            raise NotImplementedError
-
-        elif attribute == constants.VI_ATTR_TCPIP_KEEPALIVE:
+        # This is an abuse of the VISA standard
+        if attribute == constants.VI_ATTR_TCPIP_KEEPALIVE:
             return self.keepalive, StatusCode.success
-
-        elif attribute == constants.VI_ATTR_TCPIP_NODELAY:
-            raise NotImplementedError
-
-        elif attribute == constants.VI_ATTR_TCPIP_PORT:
-            raise NotImplementedError
 
         elif attribute == constants.VI_ATTR_SUPPRESS_END_EN:
             raise NotImplementedError
@@ -424,7 +830,7 @@ class TCPIPInstrSession(Session):
         """Sets timeout calculated value from python way to VI_ way"""
         if value == constants.VI_TMO_INFINITE:
             self.timeout = None
-            self._io_timeout = 2 ** 32 - 1
+            self._io_timeout = 2**32 - 1
         elif value == constants.VI_TMO_IMMEDIATE:
             self.timeout = 0
             self._io_timeout = 0
@@ -432,6 +838,235 @@ class TCPIPInstrSession(Session):
             self.timeout = value / 1000.0
             self._io_timeout = int(self.timeout * 1000)
         return StatusCode.success
+
+
+class TCPIPInstrVicp(Session):
+    """VICP Session that uses pyvicp to do the low level communication."""
+
+    # Override parsed to take into account the fact that this class is only used
+    # for a specific kind of resource
+    parsed: rname.VICPInstr
+
+    @staticmethod
+    def list_resources(wait_time=1.0) -> List[str]:
+        resources = []
+        try:
+            services = get_services("_lxi._tcp.local.", wait_time=wait_time)
+        except NotImplementedError:
+            warnings.warn(
+                "VICP resources discovery requires the zeroconf package to be "
+                "installed... try 'pip install zeroconf'",
+                UserWarning,
+            )
+            return []
+
+        for host, properties in services.items():
+            if properties["Manufacturer"].lower().startswith("lecroy"):
+                resources.append(f"VICP::{host}::INSTR")
+
+        return sorted(resources)
+
+    def after_parsing(self) -> None:
+        # TODO: board_number not handled
+        if pyvicp is None:
+            raise NotImplementedError(
+                "VICP requires the pyvicp package to be installed... "
+                "try 'pip install pyvicp'"
+            )
+
+        host_address = self.parsed.host_address
+        if "," in host_address:
+            host_address, port_str = host_address.split(",")
+            port = int(port_str)
+        else:
+            port = 1861
+
+        try:
+            self.interface = pyvicp.Client(
+                self.parsed.host_address, port, timeout=self.timeout
+            )
+        except OSError as e:
+            LOGGER.exception(
+                f"Failed to open VICP connection to {self.parsed.host_address} "
+                f"on port {port}"
+            )
+            raise OpenError() from e
+
+        # initialize the constant attributes
+        for name in ("SEND_END_EN", "TERMCHAR", "TERMCHAR_EN"):
+            attribute = getattr(constants, "VI_ATTR_" + name)
+            self.attrs[attribute] = attributes.AttributesByID[attribute].default
+
+        self.attrs[ResourceAttribute.dma_allow_enabled] = constants.VI_FALSE
+        self.attrs[ResourceAttribute.file_append_enabled] = constants.VI_FALSE
+        self.attrs[ResourceAttribute.interface_instrument_name] = "TCPIP0 (VICP)"
+        self.attrs[ResourceAttribute.interface_number] = 0
+        self.attrs[ResourceAttribute.io_prot] = constants.VI_PROT_NORMAL
+        self.attrs[ResourceAttribute.read_buffer_operation_mode] = (
+            constants.VI_FLUSH_DISABLE
+        )
+        self.attrs[ResourceAttribute.resource_lock_state] = constants.VI_NO_LOCK
+        self.attrs[ResourceAttribute.suppress_end_enabled] = constants.VI_FALSE
+        self.attrs[ResourceAttribute.tcpip_address] = self.parsed.host_address
+        self.attrs[ResourceAttribute.tcpip_hostname] = self.parsed.host_address
+        self.attrs[ResourceAttribute.tcpip_is_hislip] = constants.VI_FALSE
+        self.attrs[ResourceAttribute.tcpip_nodelay] = constants.VI_TRUE
+        self.attrs[ResourceAttribute.tcpip_port] = port
+        self.attrs[ResourceAttribute.write_buffer_operation_mode] = (
+            constants.VI_FLUSH_WHEN_FULL
+        )
+
+        # configure the variable attributes
+        self.attrs[ResourceAttribute.tcpip_keepalive] = (
+            self.get_keepalive,
+            self.set_keepalive,
+        )
+
+        # TODO: additional attributes (someday)
+        # self.attrs[ResourceAttribute.manufacturer_id] = 16711
+        # self.attrs[ResourceAttribute.max_queue_length] = 50
+        # self.attrs[ResourceAttribute.read_buffer_size] = 4096
+        # self.attrs[ResourceAttribute.resource_impl_version] = 0x0050_0c01
+        # self.attrs[ResourceAttribute.resource_manufacturer_id] = 4015
+        # self.attrs[ResourceAttribute.resource_manufacturer_name] = 'Rohde & Schwarz GmbH'
+        # self.attrs[ResourceAttribute.resource_spec_version] = 0x0050_0800
+        # self.attrs[ResourceAttribute.user_data] = 0
+        # self.attrs[ResourceAttribute.write_buffer_size] = 4096
+
+    def get_keepalive(self, attribute: ResourceAttribute) -> Tuple[bool, StatusCode]:
+        """Is TCP keepalive enabled for the resource."""
+        return self.interface.keepalive, StatusCode.success
+
+    def set_keepalive(
+        self, attribute: ResourceAttribute, keepalive: bool
+    ) -> StatusCode:
+        """Turns TCP keepalive on/off for this connection."""
+        self.interface.keepalive = keepalive
+        return StatusCode.success
+
+    def close(self) -> StatusCode:
+        self.interface.close()
+        self.interface = None
+        return StatusCode.success
+
+    def read(self, count: int) -> Tuple[bytes, StatusCode]:
+        """Reads data from device or interface synchronously.
+
+        Corresponds to viRead function of the VISA library.
+
+        Parameters
+        -----------
+        count : int
+            Number of bytes to be read.
+
+        Returns
+        -------
+        bytes
+            Data read from the device
+        StatusCode
+            Return value of the library call.
+
+        """
+        try:
+            data = self.interface.receive(count)
+        except socket.timeout:
+            return b"", StatusCode.error_timeout
+
+        if len(data) >= count:
+            return data, StatusCode.success_max_count_read
+        else:
+            return data, StatusCode.success_termination_character_read
+
+    def write(self, data: bytes) -> Tuple[int, StatusCode]:
+        """Writes data to device or interface synchronously.
+
+        Corresponds to viWrite function of the VISA library.
+
+        Parameters
+        ----------
+        data : bytes
+            Data to be written.
+
+        Returns
+        -------
+        int
+            Number of bytes actually transferred
+        StatusCode
+            Return value of the library call.
+
+        """
+        self.interface.send(data)
+
+        return len(data), StatusCode.success
+
+    def clear(self) -> StatusCode:
+        """Clears a device.
+
+        Corresponds to viClear function of the VISA library.
+
+        """
+        self.interface.device_clear()
+
+        return StatusCode.success
+
+    def _set_timeout(self, attribute: ResourceAttribute, value: int) -> StatusCode:
+        status = super()._set_timeout(attribute, value)
+        if hasattr(self.interface, "timeout"):
+            self.interface.timeout = 1e-3 * value
+
+        return status
+
+    def _get_attribute(self, attribute: ResourceAttribute) -> Tuple[Any, StatusCode]:
+        """Get the value for a given VISA attribute for this session.
+
+        Use to implement custom logic for attributes.
+
+        Parameters
+        ----------
+        attribute : ResourceAttribute
+            Attribute for which the state query is made
+
+        Returns
+        -------
+        Any
+            State of the queried attribute for a specified resource
+        StatusCode
+            Return value of the library call.
+
+        """
+        raise UnknownAttribute(attribute)
+
+    def _set_attribute(
+        self, attribute: ResourceAttribute, attribute_state: Any
+    ) -> StatusCode:
+        """Sets the state of an attribute.
+
+        Corresponds to viSetAttribute function of the VISA library.
+
+        Parameters
+        ----------
+        attribute : constants.ResourceAttribute
+            Attribute for which the state is to be modified. (Attributes.*)
+        attribute_state : Any
+            The state of the attribute to be set for the specified object.
+
+        Returns
+        -------
+        StatusCode
+            Return value of the library call.
+
+        """
+        raise UnknownAttribute(attribute)
+
+
+if pyvicp is not None:
+    Session.register(constants.InterfaceType.vicp, "INSTR")(TCPIPInstrVicp)
+else:
+    Session.register_unavailable(
+        constants.InterfaceType.vicp,
+        "INSTR",
+        "Please install PyVICP to use this resource type.",
+    )
 
 
 @Session.register(constants.InterfaceType.tcpip, "SOCKET")
@@ -556,7 +1191,7 @@ class TCPIPSocketSession(Session):
             chunk_length = self.max_recv_size
 
         term_char, _ = self.get_attribute(ResourceAttribute.termchar)
-        term_byte = common.int_to_byte(term_char) if term_char else b""
+        term_byte = int_to_byte(term_char) if term_char is not None else b""
         term_char_en, _ = self.get_attribute(ResourceAttribute.termchar_enabled)
         suppress_end_en, _ = self.get_attribute(ResourceAttribute.suppress_end_enabled)
 
@@ -578,7 +1213,6 @@ class TCPIPSocketSession(Session):
         # data arrives
         finish_time = None if self.timeout is None else (time.time() + self.timeout)
         while True:
-
             # check, if we have any data received (from pending buffer or
             # further reading)
             if term_char_en and term_byte in self._pending_buffer:
@@ -649,7 +1283,6 @@ class TCPIPSocketSession(Session):
         offset = 0
 
         while num > 0:
-
             block = data[offset : min(offset + chunk_size, sz)]
 
             try:
@@ -679,6 +1312,38 @@ class TCPIPSocketSession(Session):
             if not r:
                 break
             r[0].recv(4096)
+
+        return StatusCode.success
+
+    def flush(self, mask: BufferOperation) -> StatusCode:
+        """Flush the specified buffers.
+        Corresponds to viFlush function of the VISA library.
+        Parameters
+        ----------
+        mask : constants.BufferOperation
+            Specifies the action to be taken with flushing the buffer.
+            The values can be combined using the | operator. However multiple
+            operations on a single buffer cannot be combined.
+        Returns
+        -------
+        constants.StatusCode
+            Return value of the library call.
+        """
+        if mask & BufferOperation.discard_read_buffer:
+            self.clear()
+        if (
+            mask & BufferOperation.discard_read_buffer_no_io
+            or mask & BufferOperation.discard_receive_buffer
+            or mask & BufferOperation.discard_receive_buffer2
+        ):
+            self._pending_buffer.clear()
+        if (
+            mask & BufferOperation.flush_write_buffer
+            or mask & BufferOperation.flush_transmit_buffer
+            or mask & BufferOperation.discard_write_buffer
+            or mask & BufferOperation.discard_transmit_buffer
+        ):
+            pass
 
         return StatusCode.success
 
@@ -725,9 +1390,9 @@ class TCPIPSocketSession(Session):
             self.interface.setsockopt(
                 socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1 if attribute_state else 0
             )
-            self.interface.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
-            self.interface.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 60)
-            self.interface.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+            self.interface.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+            self.interface.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 60)
+            self.interface.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
             return StatusCode.success
         return StatusCode.error_nonsupported_attribute
 
@@ -772,3 +1437,41 @@ class TCPIPSocketSession(Session):
 
         """
         raise UnknownAttribute(attribute)
+
+
+def get_services(service_type: str, wait_time: float = 0.1) -> Dict[str, dict]:
+    if zeroconf is None:
+        raise NotImplementedError(
+            "Service discovery requires the zeroconf package to be installed... "
+            "try 'pip install zeroconf'"
+        )
+
+    class MyListener(zeroconf.ServiceListener):
+        def __init__(self, *args, **kwargs):
+            self.services = {}
+            super().__init__(*args, **kwargs)
+
+        def remove_service(self, zc: zeroconf.Zeroconf, type_: str, name: str) -> None:
+            del self.services[name]
+
+        def add_service(self, zc: zeroconf.Zeroconf, type_: str, name: str) -> None:
+            info = zc.get_service_info(type_, name)
+            if info is None:
+                return
+            properties = {}
+            for key, val in info.properties.items():
+                if key == b"txtvers":
+                    continue
+                properties[key.decode()] = val.decode()
+            ipaddr = ipaddress.ip_address(info.addresses[0])
+            self.services[str(ipaddr)] = properties
+
+        update_service = add_service
+
+    zero_conf = zeroconf.Zeroconf()
+    listener = MyListener()
+    browser = zeroconf.ServiceBrowser(zero_conf, service_type, listener, delay=0)
+    time.sleep(wait_time)
+    browser.cancel()
+    zero_conf.close()
+    return listener.services

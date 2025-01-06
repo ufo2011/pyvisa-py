@@ -6,10 +6,11 @@ USB-TMC(Test and Measurement class) devices. by Noboru Yamamot, Accl. Lab, KEK, 
 
 This file is an offspring of the Lantz Project.
 
-:copyright: 2014-2020 by PyVISA-py Authors, see AUTHORS for more details.
+:copyright: 2014-2024 by PyVISA-py Authors, see AUTHORS for more details.
 :license: MIT, see LICENSE for more details.
 
 """
+
 from .usbtmc import USBRaw as USBRaw
 from .usbutil import find_devices, find_interfaces
 
@@ -28,8 +29,7 @@ def find_raw_devices(
 
 
 class USBRawDevice(USBRaw):
-
-    RECV_CHUNK = 1024 ** 2
+    RECV_CHUNK = 1024**2
 
     find_devices = staticmethod(find_raw_devices)
 

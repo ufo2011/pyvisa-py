@@ -7,10 +7,11 @@ http://www.beyondlogic.org/usbnutshell/usb5.shtml
 
 This file is an offspring of the Lantz Project.
 
-:copyright: 2014-2020 by PyVISA-py Authors, see AUTHORS for more details.
+:copyright: 2014-2024 by PyVISA-py Authors, see AUTHORS for more details.
 :license: MIT, see LICENSE for more details.
 
 """
+
 from fnmatch import fnmatch
 
 import usb
@@ -116,7 +117,7 @@ AllCodes = {
         0x04,
         0x07,
     ): "RNDIS for GPRS. Connecting a host to the Internet over GPRS mobile "
-    "device using the device‚Äôs cellular radio.",
+    "device using the device,Äôs cellular radio.",
     (0xEF, 0x05, 0x00): "USB3 Vision Control Interface",
     (0xEF, 0x05, 0x01): "USB3 Vision Event Interface",
     (0xEF, 0x05, 0x02): "USB3 Vision Streaming Interface",

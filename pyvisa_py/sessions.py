@@ -2,22 +2,41 @@
 """Base Session class.
 
 
-:copyright: 2014-2020 by PyVISA-py Authors, see AUTHORS for more details.
+:copyright: 2014-2024 by PyVISA-py Authors, see AUTHORS for more details.
 :license: MIT, see LICENSE for more details.
 
 """
+
 import abc
 import time
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Type, TypeVar
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+)
 
-from pyvisa import attributes, constants, logger, rname
+from pyvisa import attributes, constants, rname
 from pyvisa.constants import ResourceAttribute, StatusCode
 from pyvisa.typing import VISARMSession
 
-from .common import int_to_byte
+from .common import LOGGER, int_to_byte
 
 #: Type var used when typing register.
 T = TypeVar("T", bound=Type["Session"])
+
+
+class OpenError(Exception):
+    """Custom exception signaling we failed to open a resource."""
+
+    def __init__(self, error_code: StatusCode = StatusCode.error_resource_not_found):
+        self.error_code = error_code
 
 
 class UnknownAttribute(Exception):
@@ -122,8 +141,8 @@ class Session(metaclass=abc.ABCMeta):
     #: Session type as (Interface Type, Resource Class)
     session_type: Tuple[constants.InterfaceType, str]
 
-    #: Timeout in seconds to use when opening the resource.
-    open_timeout: Optional[float]
+    #: Timeout in milliseconds to use when opening the resource.
+    open_timeout: Optional[int]
 
     #: Value of the timeout in seconds used for general operation
     timeout: Optional[float]
@@ -138,9 +157,9 @@ class Session(metaclass=abc.ABCMeta):
     #: Maps (Interface Type, Resource Class) to Python class encapsulating that
     #: resource.
     #: dict[(Interface Type, Resource Class) , Session]
-    _session_classes: Dict[
-        Tuple[constants.InterfaceType, str], Type["Session"]
-    ] = dict()
+    _session_classes: ClassVar[
+        Dict[Tuple[constants.InterfaceType, str], Type["Session"]]
+    ] = {}
 
     @staticmethod
     def list_resources() -> List[str]:
@@ -158,7 +177,7 @@ class Session(metaclass=abc.ABCMeta):
     ) -> Iterator[Tuple[Tuple[constants.InterfaceType, str], Type["Session"]]]:
         """Iterator over valid sessions classes infos."""
         for key, val in cls._session_classes.items():
-            if issubclass(val, Session):
+            if not issubclass(val, UnavailableSession):
                 yield key, val
 
     @classmethod
@@ -167,10 +186,8 @@ class Session(metaclass=abc.ABCMeta):
     ) -> Iterator[Tuple[Tuple[constants.InterfaceType, str], str]]:
         """Iterator over invalid sessions classes (i.e. those with import errors)."""
         for key, val in cls._session_classes.items():
-            try:
+            if issubclass(val, UnavailableSession):
                 yield key, getattr(val, "session_issue")
-            except AttributeError:
-                pass
 
     @classmethod
     def get_session_class(
@@ -220,10 +237,11 @@ class Session(metaclass=abc.ABCMeta):
 
         def _internal(python_class):
             if (interface_type, resource_class) in cls._session_classes:
-                logger.warning(
+                LOGGER.warning(
                     "%s is already registered in the "
                     "ResourceManager. Overwriting with %s",
-                    ((interface_type, resource_class), python_class),
+                    (interface_type, resource_class),
+                    python_class,
                 )
 
             python_class.session_type = (interface_type, resource_class)
@@ -257,28 +275,16 @@ class Session(metaclass=abc.ABCMeta):
 
         """
 
-        class _internal(Session):
-
+        class _internal(UnavailableSession):
             #: Message detailing why no session is available.
-            session_issue: str = msg
-
-            def __init__(self, *args, **kwargs) -> None:
-                raise ValueError(msg)
-
-            def _get_attribute(self, attr):
-                raise NotImplementedError()
-
-            def _set_attribute(self, attr, value):
-                raise NotImplementedError()
-
-            def close(self):
-                raise NotImplementedError()
+            session_issue = msg
 
         if (interface_type, resource_class) in cls._session_classes:
-            logger.warning(
+            LOGGER.warning(
                 "%s is already registered in the ResourceManager. "
                 "Overwriting with unavailable %s",
-                ((interface_type, resource_class), msg),
+                (interface_type, resource_class),
+                msg,
             )
 
         cls._session_classes[(interface_type, resource_class)] = _internal
@@ -288,7 +294,7 @@ class Session(metaclass=abc.ABCMeta):
         resource_manager_session: VISARMSession,
         resource_name: str,
         parsed: Optional[rname.ResourceName] = None,
-        open_timeout: Optional[float] = None,
+        open_timeout: Optional[int] = None,
     ) -> None:
         if parsed is None:
             parsed = rname.parse_resource_name(resource_name)
@@ -324,11 +330,11 @@ class Session(metaclass=abc.ABCMeta):
 
     def after_parsing(self) -> None:
         """Override this method to provide custom initialization code, to be
-        called after the resourcename is properly parsed
+        called after the resource name is properly parsed
 
         ResourceSession can register resource specific attributes handling of
         them into self.attrs.
-        It is also possible to change handling of already registerd common
+        It is also possible to change handling of already registered common
         attributes. List of attributes is available in pyvisa package:
         * name is in constants module as: VI_ATTR_<NAME>
         * validity of attribute for resource is defined module attributes,
@@ -668,7 +674,7 @@ class Session(metaclass=abc.ABCMeta):
         try:
             return self._get_attribute(attribute)
         except UnknownAttribute as e:
-            logger.exception(str(e))
+            LOGGER.exception(str(e))
             return 0, StatusCode.error_nonsupported_attribute
 
     def set_attribute(
@@ -731,10 +737,10 @@ class Session(metaclass=abc.ABCMeta):
             return StatusCode.error_nonsupported_attribute_state
         except NotImplementedError:
             e = UnknownAttribute(attribute)
-            logger.exception(str(e))
+            LOGGER.exception(str(e))
             return StatusCode.error_nonsupported_attribute
         except UnknownAttribute as e:
-            logger.exception(str(e))
+            LOGGER.exception(str(e))
             return StatusCode.error_nonsupported_attribute
 
     def _read(
@@ -797,10 +803,9 @@ class Session(metaclass=abc.ABCMeta):
             if current:
                 out.extend(current)
                 end_indicator_received = end_indicator_checker(current)
-                if end_indicator_received:
-                    if not suppress_end_en:
-                        # RULE 6.1.1
-                        return bytes(out), StatusCode.success
+                if end_indicator_received and not suppress_end_en:
+                    # RULE 6.1.1
+                    return bytes(out), StatusCode.success
                 else:
                     if termination_char_en and (term_char in current):
                         # RULE 6.1.2
@@ -853,3 +858,19 @@ class Session(metaclass=abc.ABCMeta):
         else:
             self.timeout = value / 1000.0
         return StatusCode.success
+
+
+class UnavailableSession(Session):
+    session_issue: ClassVar[str]
+
+    def __init__(self, *args, **kwargs) -> None:
+        raise ValueError(self.session_issue)
+
+    def _get_attribute(self, attr):
+        raise NotImplementedError()
+
+    def _set_attribute(self, attr, value):
+        raise NotImplementedError()
+
+    def close(self):
+        raise NotImplementedError()

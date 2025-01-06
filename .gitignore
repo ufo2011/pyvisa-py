@@ -18,3 +18,7 @@ _test/
 .pytest_cache/
 .cache/
 .vscode
+.dmypy.json
+
+# auto-generated version file
+version.py

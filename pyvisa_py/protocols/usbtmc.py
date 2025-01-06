@@ -6,11 +6,13 @@ Measurement class)　devices. by Noboru Yamamot, Accl. Lab, KEK, JAPAN
 
 This file is an offspring of the Lantz Project.
 
-:copyright: 2014-2020 by PyVISA-py Authors, see AUTHORS for more details.
+:copyright: 2014-2024 by PyVISA-py Authors, see AUTHORS for more details.
 :license: MIT, see LICENSE for more details.
 
 """
+
 import enum
+import math
 import struct
 import time
 import warnings
@@ -97,7 +99,7 @@ class BulkOutMessage(object):
 class BulkInMessage(
     namedtuple(
         "BulkInMessage",
-        "msgid btag btaginverse " "transfer_size transfer_attributes data",
+        "msgid btag btaginverse transfer_size transfer_attributes data",
     )
 ):
     """The Host uses the Bulk-IN endpoint to read USBTMC response messages from
@@ -113,7 +115,9 @@ class BulkInMessage(
         msgid, btag, btaginverse = struct.unpack_from("BBBx", data)
         if msgid != MsgID.dev_dep_msg_in:
             warnings.warn(
-                "Unexpected MsgID format. Consider updating the device's firmware. See https://github.com/pyvisa/pyvisa-py/issues/20"
+                "Unexpected MsgID format. Consider updating the device's firmware. "
+                "See https://github.com/pyvisa/pyvisa-py/issues/20"
+                f"Expected message id was {MsgID.dev_dep_msg_in}, got {msgid}."
             )
             return BulkInMessage.from_quirky(data)
 
@@ -164,7 +168,7 @@ class USBRaw(object):
     """
 
     #: Configuration number to be used. If None, the default will be used.
-    CONFIGURATION = None
+    CONFIGURATION: int | None = None
 
     #: Interface index it be used
     INTERFACE = (0, 0)
@@ -182,7 +186,7 @@ class USBRaw(object):
         serial_number=None,
         device_filters=None,
         timeout=None,
-        **kwargs
+        **kwargs,
     ):
         super(USBRaw, self).__init__()
 
@@ -200,8 +204,8 @@ class USBRaw(object):
         elif len(devices) > 1:
             desc = "\n".join(str(dev) for dev in devices)
             raise ValueError(
-                "{} devices found:\n{}\nPlease narrow the search"
-                " criteria".format(len(devices), desc)
+                f"{len(devices)} devices found:\n{desc}\nPlease narrow the search"
+                " criteria"
             )
 
         self.usb_dev = devices[0]
@@ -213,14 +217,35 @@ class USBRaw(object):
             pass
 
         try:
-            self.usb_dev.set_configuration()
-        except usb.core.USBError as e:
-            raise Exception("failed to set configuration\n %s" % e)
-
-        try:
-            self.usb_dev.set_interface_altsetting()
+            cfg = self.usb_dev.get_active_configuration()
         except usb.core.USBError:
-            pass
+            cfg = None
+
+        if cfg is None:
+            try:
+                self.usb_dev.set_configuration()
+                cfg = self.usb_dev.get_active_configuration()
+            except usb.core.USBError as e:
+                raise Exception("failed to set configuration\n %s" % e)
+
+        intf = cfg[(0, 0)]
+
+        # Check if the interface exposes multiple alternative setting and
+        # set one only if there is more than one.
+        if (
+            len(
+                tuple(
+                    usb.util.find_descriptor(
+                        cfg, find_all=True, bInterfaceNumber=intf.bInterfaceNumber
+                    )
+                )
+            )
+            > 1
+        ):
+            try:
+                self.usb_dev.set_interface_altsetting()
+            except usb.core.USBError:
+                pass
 
         self.usb_intf = self._find_interface(self.usb_dev, self.INTERFACE)
 
@@ -277,10 +302,6 @@ class USBRaw(object):
 
 
 class USBTMC(USBRaw):
-
-    # Maximum number of bytes per transfer (for sending and receiving).
-    RECV_CHUNK = 1024 ** 2
-
     find_devices = staticmethod(find_tmc_devices)
 
     def __init__(self, vendor=None, product=None, serial_number=None, **kwargs):
@@ -288,9 +309,6 @@ class USBTMC(USBRaw):
         self.usb_intr_in = find_endpoint(
             self.usb_intf, usb.ENDPOINT_IN, usb.ENDPOINT_TYPE_INTERRUPT
         )
-
-        self.usb_dev.reset()
-        self.usb_dev.set_configuration()
 
         time.sleep(0.01)
 
@@ -386,7 +404,7 @@ class USBTMC(USBRaw):
             return
 
         # Read remaining data from Bulk-IN endpoint.
-        self.usb_recv_ep.read(self.RECV_CHUNK, abort_timeout_ms)
+        self.usb_recv_ep.read(self.usb_recv_ep.wMaxPacketSize, abort_timeout_ms)
 
         # Send CHECK_ABORT_BULK_IN_STATUS until it completes.
         # According to USBTMC 1.00 4.2.1.5:
@@ -426,7 +444,7 @@ class USBTMC(USBRaw):
         # Set the EOM flag on the last transfer only.
         # Send at least one transfer (possibly empty).
         while (end == 0) or (end < size):
-            begin, end = end, begin + self.RECV_CHUNK
+            begin, end = end, begin + self.usb_send_ep.wMaxPacketSize
 
             self._btag = (self._btag % 255) + 1
 
@@ -438,40 +456,76 @@ class USBTMC(USBRaw):
         return size
 
     def read(self, size):
-
-        recv_chunk = self.RECV_CHUNK
-        if size > 0 and size < recv_chunk:
-            recv_chunk = size
-
-        header_size = 12
-        max_padding = 511
-
+        usbtmc_header_size = 12
         eom = False
 
         raw_read = super(USBTMC, self).read
         raw_write = super(USBTMC, self).write
 
-        received = bytearray()
+        received_message = bytearray()
 
         while not eom:
+            received_transfer = bytearray()
             self._btag = (self._btag % 255) + 1
 
-            req = BulkInMessage.build_array(self._btag, recv_chunk, None)
-
+            req = BulkInMessage.build_array(self._btag, size, None)
             raw_write(req)
 
             try:
-                resp = raw_read(recv_chunk + header_size + max_padding)
+                # make sure the data request is in multitudes of wMaxPacketSize.
+                # + 1 * wMaxPacketSize for message sizes that equals wMaxPacketSize == size + usbtmc_header_size.
+                # This to be able to retrieve a short package to end communication
+                # (see USB 2.0 Section 5.8.3 and USBTMC Section 3.3)
+                chunk_size = (
+                    math.floor(
+                        (size + usbtmc_header_size) / self.usb_recv_ep.wMaxPacketSize
+                    )
+                    + 1
+                ) * self.usb_recv_ep.wMaxPacketSize
+                resp = raw_read(chunk_size)
+
                 response = BulkInMessage.from_bytes(resp)
+                received_transfer.extend(response.data)
+
+                # Detect EOM only when device sends all expected bytes.
+                if len(received_transfer) >= response.transfer_size:
+                    eom = response.transfer_attributes & 1
+                if not eom and len(received_transfer) >= size:
+                    # Read asking for 'size' bytes from the device.
+                    # This may be less then the device wants to send back in a message
+                    # Therefore the request does not mean that we must receive a EOM.
+                    # Multiple `transfers` will be required to retrieve the remaining bytes.
+                    eom = True
+                else:
+                    while (
+                        (len(resp) % self.usb_recv_ep.wMaxPacketSize) == 0
+                        or len(received_transfer) < response.transfer_size
+                    ) and not eom:
+                        # USBTMC Section 3.3 specifies that the first usb packet
+                        # must contain the header. the remaining packets do not need
+                        # the header the message is finished when a "short packet"
+                        # is sent (one whose length is less than wMaxPacketSize)
+                        # wMaxPacketSize may be incorrectly reported by certain drivers.
+                        # Therefore, continue reading until the transfer_size is reached.
+                        chunk_size = (
+                            math.floor(
+                                (size - len(received_transfer))
+                                / self.usb_recv_ep.wMaxPacketSize
+                            )
+                            + 1
+                        ) * self.usb_recv_ep.wMaxPacketSize
+                        resp = raw_read(chunk_size)
+                        received_transfer.extend(resp)
+                    if len(received_transfer) >= response.transfer_size:
+                        eom = response.transfer_attributes & 1
+                    if not eom and len(received_transfer) >= size:
+                        eom = True
+                # Truncate data to the specified length (discard padding)
+                # USBTMC header (12 bytes) has already truncated
+                received_message.extend(received_transfer[: response.transfer_size])
             except (usb.core.USBError, ValueError):
                 # Abort failed Bulk-IN operation.
                 self._abort_bulk_in(self._btag)
                 raise
 
-            received.extend(response.data)
-
-            # Detect EOM only when device sends all expected bytes.
-            if len(response.data) >= response.transfer_size:
-                eom = response.transfer_attributes & 1
-
-        return bytes(received)
+        return bytes(received_message)

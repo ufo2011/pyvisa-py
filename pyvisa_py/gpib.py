@@ -2,18 +2,20 @@
 """GPIB Session implementation using linux-gpib or gpib-ctypes.
 
 
-:copyright: 2015-2020 by PyVISA-py Authors, see AUTHORS for more details.
+:copyright: 2015-2024 by PyVISA-py Authors, see AUTHORS for more details.
 :license: MIT, see LICENSE for more details.
 
 """
+
 import ctypes  # Used for missing bindings not ideal
 from bisect import bisect
 from typing import Any, Iterator, List, Tuple, Union
 
-from pyvisa import attributes, constants, logger
+from pyvisa import attributes, constants
 from pyvisa.constants import ResourceAttribute, StatusCode
 from pyvisa.rname import GPIBInstr, GPIBIntfc
 
+from .common import LOGGER
 from .sessions import Session, UnknownAttribute
 
 try:
@@ -22,16 +24,27 @@ try:
     from gpib_ctypes.Gpib import Gpib  # typing: ignore
     from gpib_ctypes.gpib.gpib import _lib as gpib_lib  # typing: ignore
 
-    # Add some extra binding not available by default
-    extra_funcs = [
-        ("ibcac", [ctypes.c_int, ctypes.c_int], ctypes.c_int),
-        ("ibgts", [ctypes.c_int, ctypes.c_int], ctypes.c_int),
-        ("ibpct", [ctypes.c_int], ctypes.c_int),
-    ]
-    for name, argtypes, restype in extra_funcs:
-        libfunction = gpib_lib[name]
-        libfunction.argtypes = argtypes
-        libfunction.restype = restype
+    try:
+        # Add some extra binding not available by default
+        extra_funcs = [
+            ("ibcac", [ctypes.c_int, ctypes.c_int], ctypes.c_int),
+            ("ibgts", [ctypes.c_int, ctypes.c_int], ctypes.c_int),
+            ("ibpct", [ctypes.c_int], ctypes.c_int),
+        ]
+        for name, argtypes, restype in extra_funcs:
+            libfunction = gpib_lib[name]
+            libfunction.argtypes = argtypes
+            libfunction.restype = restype
+    except TypeError:
+        msg = (
+            "gpib_ctypes is installed but could not locate the gpib library.\n"
+            "Please manually load it using:\n"
+            "  gpib_ctypes.gpib.gpib._load_lib(filename)\n"
+            "before importing pyvisa."
+        )
+        Session.register_unavailable(constants.InterfaceType.gpib, "INSTR", msg)
+        Session.register_unavailable(constants.InterfaceType.gpib, "INTFC", msg)
+        raise
 
 except ImportError:
     GPIB_CTYPES = False
@@ -39,15 +52,13 @@ except ImportError:
         import gpib  # typing: ignore
         from Gpib import Gpib  # typing: ignore
     except ImportError as e:
-        Session.register_unavailable(
-            constants.InterfaceType.gpib,
-            "INSTR",
-            "Please install linux-gpib (Linux) or "
-            "gpib-ctypes (Windows, Linux) to use "
-            "this resource type. Note that installing"
-            " gpib-ctypes will give you access to a "
-            "broader range of funcionality.\n%s" % e,
+        msg = (
+            "Please install linux-gpib (Linux) or gpib-ctypes (Windows, Linux) "
+            "to use this resource type. Note that installing gpib-ctypes will "
+            "give you access to a broader range of functionalities.\n%s" % e
         )
+        Session.register_unavailable(constants.InterfaceType.gpib, "INSTR", msg)
+        Session.register_unavailable(constants.InterfaceType.gpib, "INTFC", msg)
         raise
 
 
@@ -73,21 +84,27 @@ def _find_boards() -> Iterator[Tuple[int, int]]:
         try:
             yield board, gpib.ask(board, 1)
         except gpib.GpibError as e:
-            logger.debug("GPIB board %i error in _find_boards(): %s", board, repr(e))
+            LOGGER.debug("GPIB board %i error in _find_boards(): %s", board, repr(e))
 
 
-def _find_listeners() -> Iterator[Tuple[int, int]]:
+def _find_listeners() -> Iterator[Tuple[int, int, int]]:
     """Find GPIB listeners."""
     for board, boardpad in _find_boards():
         for i in range(31):
+            j = 0
             try:
                 if boardpad != i and gpib.listener(board, i):
-                    yield board, i
+                    yield board, i, j
+                elif boardpad != i:
+                    for j in range(96, 126):
+                        if gpib.listener(board, i, j):
+                            yield board, i, j
             except gpib.GpibError as e:
-                logger.debug(
-                    "GPIB board %i addr %i error in _find_listeners(): %s",
+                LOGGER.debug(
+                    "GPIB board %i paddr %i saddr %i error in _find_listeners(): %s",
                     board,
                     i,
+                    j,
                     repr(e),
                 )
 
@@ -188,7 +205,7 @@ def convert_gpib_error(
     # feels brittle. As a consequence we only try to be smart when using
     # gpib-ctypes. However in both cases we log the exception at debug level.
     else:
-        logger.debug("Failed to %s.", exc_info=error)
+        LOGGER.debug("Failed to %s.", operation, exc_info=error)
         if not GPIB_CTYPES:
             return StatusCode.error_system_error
         if error.code == 1:
@@ -255,6 +272,8 @@ class _GPIBCommon(Session):
 
     def after_parsing(self) -> None:
         minor = int(self.parsed.board)
+        # Secondary address (SAD) values should be in the range 96 to 126,
+        # 0 means the SAD is disabled.
         sad = 0
         timeout = 13
         send_eoi = 1
@@ -262,6 +281,8 @@ class _GPIBCommon(Session):
         self.interface = None
         if isinstance(self.parsed, GPIBInstr):
             pad = int(self.parsed.primary_address)
+            if self.parsed.secondary_address is not None:
+                sad = int(self.parsed.secondary_address) + 0x60
             # Used to talk to a specific resource
             self.interface = Gpib(
                 name=minor,
@@ -366,9 +387,9 @@ class _GPIBCommon(Session):
         ifc = self.interface or self.controller
 
         # END 0x2000
-        checker = lambda current: ifc.ibsta() & 0x2000
+        checker = lambda current: ifc.ibsta() & 0x2000  # noqa: E731
 
-        reader = lambda: ifc.read(count)
+        reader = lambda: ifc.read(count)  # noqa: E731
 
         return self._read(reader, count, checker, False, None, False, gpib.GpibError)
 
@@ -390,7 +411,7 @@ class _GPIBCommon(Session):
             Return value of the library call.
 
         """
-        logger.debug("GPIB.write %r" % data)
+        LOGGER.debug("GPIB.write %r" % data)
 
         # INTFC don't have an interface so use the controller
         ifc = self.interface or self.controller
@@ -625,7 +646,12 @@ class GPIBSession(_GPIBCommon):
 
     @staticmethod
     def list_resources() -> List[str]:
-        return ["GPIB%d::%d::INSTR" % (board, pad) for board, pad in _find_listeners()]
+        return [
+            "GPIB%d::%d::INSTR" % (board, pad)
+            if sad == 0
+            else "GPIB%d::%d::%d::INSTR" % (board, pad, sad - 0x60)
+            for board, pad, sad in _find_listeners()
+        ]
 
     def clear(self) -> StatusCode:
         """Clears a device.
@@ -638,7 +664,7 @@ class GPIBSession(_GPIBCommon):
             Return value of the library call.
 
         """
-        logger.debug("GPIB.device clear")
+        LOGGER.debug("GPIB.device clear")
         try:
             self.interface.clear()
             return StatusCode.success
@@ -660,7 +686,7 @@ class GPIBSession(_GPIBCommon):
             Return value of the library call.
 
         """
-        logger.debug("GPIB.device assert hardware trigger")
+        LOGGER.debug("GPIB.device assert hardware trigger")
 
         try:
             if protocol == constants.VI_TRIG_PROT_DEFAULT:
@@ -813,7 +839,7 @@ class GPIBInterface(_GPIBCommon):
         Corresponds to viGpibSendIFC function of the VISA library.
 
         """
-        logger.debug("GPIB.interface clear")
+        LOGGER.debug("GPIB.interface clear")
         try:
             self.controller.interface_clear()
             return StatusCode.success
@@ -837,7 +863,7 @@ class GPIBInterface(_GPIBCommon):
             Return value of the library call.
 
         """
-        logger.debug("GPIB.control atn")
+        LOGGER.debug("GPIB.control atn")
         if mode == constants.VI_GPIB_ATN_ASSERT:
             status = gpib_lib.ibcac(self.controller.id, 0)
         elif mode == constants.VI_GPIB_ATN_DEASSERT:
@@ -874,11 +900,11 @@ class GPIBInterface(_GPIBCommon):
 
         """
         # ibpct need to get the device id matching the primary and secondary address
-        logger.debug("GPIB.pass control")
+        LOGGER.debug("GPIB.pass control")
         try:
             did = gpib.dev(self.parsed.board, primary_address, secondary_address)
         except gpib.GpibError:
-            logger.exception(
+            LOGGER.exception(
                 "Failed to get id for %s, %d", primary_address, secondary_address
             )
             return StatusCode.error_resource_not_found

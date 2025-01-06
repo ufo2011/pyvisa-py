@@ -2,10 +2,11 @@
 """Serial Session implementation using PyUSB.
 
 
-:copyright: 2014-2020 by PyVISA-py Authors, see AUTHORS for more details.
+:copyright: 2014-2024 by PyVISA-py Authors, see AUTHORS for more details.
 :license: MIT, see LICENSE for more details.
 
 """
+
 import errno
 from typing import Any, List, Tuple, Type, Union
 
@@ -13,7 +14,7 @@ from pyvisa import attributes, constants
 from pyvisa.constants import ResourceAttribute, StatusCode
 from pyvisa.rname import USBInstr, USBRaw
 
-from .common import logger
+from .common import LOGGER
 from .sessions import Session, UnknownAttribute
 
 try:
@@ -84,17 +85,35 @@ class USBSession(Session):
             self.parsed.serial_number,
         )
 
-        for name in ("SEND_END_EN", "SUPPRESS_END_EN", "TERMCHAR", "TERMCHAR_EN"):
+        self.attrs.update(
+            {
+                ResourceAttribute.manufacturer_id: int(self.parsed.manufacturer_id, 0),
+                ResourceAttribute.model_code: int(self.parsed.model_code, 0),
+                ResourceAttribute.usb_serial_number: self.parsed.serial_number,
+                ResourceAttribute.usb_interface_number: int(
+                    self.parsed.usb_interface_number
+                ),
+            }
+        )
+
+        for name, attr in (
+            ("SEND_END_EN", ResourceAttribute.send_end_enabled),
+            ("SUPPRESS_END_EN", ResourceAttribute.suppress_end_enabled),
+            ("TERMCHAR", ResourceAttribute.termchar),
+            ("TERMCHAR_EN", ResourceAttribute.termchar_enabled),
+        ):
             attribute = getattr(constants, "VI_ATTR_" + name)
-            self.attrs[attribute] = attributes.AttributesByID[attribute].default
+            self.attrs[attr] = attributes.AttributesByID[attribute].default
 
         # Force setting the timeout to get the proper value
-        attribute = constants.VI_ATTR_TMO_VALUE
-        self.set_attribute(attribute, attributes.AttributesByID[attribute].default)
+        self.set_attribute(
+            ResourceAttribute.timeout_value,
+            attributes.AttributesByID[attribute].default,
+        )
 
     def _get_timeout(self, attribute: ResourceAttribute) -> Tuple[int, StatusCode]:
         if self.interface:
-            if self.interface.timeout == 2 ** 32 - 1:
+            if self.interface.timeout == 2**32 - 1:
                 self.timeout = None
             else:
                 self.timeout = self.interface.timeout / 1000
@@ -102,8 +121,8 @@ class USBSession(Session):
 
     def _set_timeout(self, attribute: ResourceAttribute, value: int) -> StatusCode:
         status = super(USBSession, self)._set_timeout(attribute, value)
-        timeout = int(self.timeout * 1000) if self.timeout else 2 ** 32 - 1
-        timeout = min(timeout, 2 ** 32 - 1)
+        timeout = int(self.timeout * 1000) if self.timeout else 2**32 - 1
+        timeout = min(timeout, 2**32 - 1)
         if self.interface:
             self.interface.timeout = timeout
         return status
@@ -137,11 +156,6 @@ class USBSession(Session):
                 raise
 
         supress_end_en, _ = self.get_attribute(ResourceAttribute.suppress_end_enabled)
-
-        if supress_end_en:
-            raise ValueError(
-                "VI_ATTR_SUPPRESS_END_EN == True is currently unsupported by pyvisa-py"
-            )
 
         term_char, _ = self.get_attribute(ResourceAttribute.termchar)
         term_char_en, _ = self.get_attribute(ResourceAttribute.termchar_enabled)
@@ -263,27 +277,27 @@ class USBInstrSession(USBSession):
                     "Found a device whose serial number cannot be read."
                     " The partial VISA resource name is: " + fmt
                 )
-                logger.warning(
+                LOGGER.warning(
                     msg,
-                    dict(
-                        board=0,
-                        manufacturer_id=dev.idVendor,
-                        model_code=dev.idProduct,
-                        serial_number="???",
-                        usb_interface_number=intfc,
-                    ),
+                    {
+                        "board": 0,
+                        "manufacturer_id": dev.idVendor,
+                        "model_code": dev.idProduct,
+                        "serial_number": "???",
+                        "usb_interface_number": intfc,
+                    },
                 )
                 continue
 
             out.append(
                 fmt
-                % dict(
-                    board=0,
-                    manufacturer_id=dev.idVendor,
-                    model_code=dev.idProduct,
-                    serial_number=serial,
-                    usb_interface_number=intfc,
-                )
+                % {
+                    "board": 0,
+                    "manufacturer_id": dev.idVendor,
+                    "model_code": dev.idProduct,
+                    "serial_number": serial,
+                    "usb_interface_number": intfc,
+                }
             )
         return out
 
@@ -315,31 +329,31 @@ class USBRawSession(USBSession):
 
             try:
                 serial = dev.serial_number
-            except (NotImplementedError, ValueError):
+            except (NotImplementedError, ValueError, usb.USBError):
                 msg = (
                     "Found a device whose serial number cannot be read."
                     " The partial VISA resource name is: " + fmt
                 )
-                logger.warning(
+                LOGGER.warning(
                     msg,
-                    dict(
-                        board=0,
-                        manufacturer_id=dev.idVendor,
-                        model_code=dev.idProduct,
-                        serial_number="???",
-                        usb_interface_number=intfc,
-                    ),
+                    {
+                        "board": 0,
+                        "manufacturer_id": dev.idVendor,
+                        "model_code": dev.idProduct,
+                        "serial_number": "???",
+                        "usb_interface_number": intfc,
+                    },
                 )
                 continue
 
             out.append(
                 fmt
-                % dict(
-                    board=0,
-                    manufacturer_id=dev.idVendor,
-                    model_code=dev.idProduct,
-                    serial_number=serial,
-                    usb_interface_number=intfc,
-                )
+                % {
+                    "board": 0,
+                    "manufacturer_id": dev.idVendor,
+                    "model_code": dev.idProduct,
+                    "serial_number": serial,
+                    "usb_interface_number": intfc,
+                }
             )
         return out
