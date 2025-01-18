@@ -41,7 +41,7 @@ implements most of the methods for Message Based communication
 (Serial/USB/GPIB/Ethernet) using Python and some well developed, easy to deploy
 and cross platform libraries
 
-.. _VISA: http://www.ivifoundation.org/Downloads/Specifications.htm
+.. _VISA: https://www.ivifoundation.org/specifications/default.html#visa-specifications
 
 
 VISA and Python
@@ -61,20 +61,26 @@ controlling:
 Requirements
 ------------
 
-- Python (tested with 3.6+)
-- PyVISA 1.11+
+- Python 3
+- PyVISA
 
-Optionally
+Optionally:
+
 - PySerial (to interface with Serial instruments)
 - PyUSB (to interface with USB instruments)
 - linux-gpib (to interface with gpib instruments, only on linux)
 - gpib-ctypes (to interface with GPIB instruments on Windows and Linux)
+- psutil (to discover TCPIP devices across multiple interfaces)
+- zeroconf (for HiSLIP and VICP devices discovery)
+- pyvicp (to enable the Teledyne LeCroy proprietary VICP protocol)
 
+Please refer to `pyproject.toml <./pyproject.toml>`_ for the specific version
+requirements.
 
 Installation
 --------------
 
-Using pip:
+Using pip::
 
     $ pip install pyvisa-py
 

@@ -1,14 +1,13 @@
-# -*- coding: utf-8 -*-
 """Test creating a resource manager using PyVISA-Py as a backend.
 
 
-:copyright: 2014-2020 by PyVISA-py Authors, see AUTHORS for more details.
+:copyright: 2014-2024 by PyVISA-py Authors, see AUTHORS for more details.
 :license: MIT, see LICENSE for more details.
 
 """
+
 from pyvisa.highlevel import list_backends
 from pyvisa.testsuite import BaseTestCase
-
 from pyvisa_py import highlevel
 
 

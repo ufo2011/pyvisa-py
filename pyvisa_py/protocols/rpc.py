@@ -13,19 +13,20 @@ Original source:
     http://svn.python.org/projects/python/trunk/Demo/rpc/rpc.py
 
 
-:copyright: 2014-2020 by PyVISA-py Authors, see AUTHORS for more details.
+:copyright: 2014-2024 by PyVISA-py Authors, see AUTHORS for more details.
 :license: MIT, see LICENSE for more details.
 
 """
+
 import enum
 import select
 import socket
 import struct
 import sys
 import time
-import xdrlib
 
-from ..common import logger
+from ..common import LOGGER
+from . import xdrlib
 
 #: Version of the protocol
 RPCVERSION = 2
@@ -37,7 +38,6 @@ class MessagegType(enum.IntEnum):
 
 
 class AuthorizationFlavor(enum.IntEnum):
-
     null = 0
     unix = 1
     short = 2
@@ -45,13 +45,11 @@ class AuthorizationFlavor(enum.IntEnum):
 
 
 class ReplyStatus(enum.IntEnum):
-
     accepted = 0
     denied = 1
 
 
 class AcceptStatus(enum.IntEnum):
-
     #: RPC executed successfully
     success = 0
 
@@ -69,7 +67,6 @@ class AcceptStatus(enum.IntEnum):
 
 
 class RejectStatus(enum.IntEnum):
-
     #: RPC version number != 2
     rpc_mismatch = 0
 
@@ -228,7 +225,7 @@ class Client(object):
 
     def make_call(self, proc, args, pack_func, unpack_func):
         # Don't normally override this (but see Broadcast)
-        logger.debug("Make call %r, %r, %r, %r", proc, args, pack_func, unpack_func)
+        LOGGER.debug("Make call %r, %r, %r, %r", proc, args, pack_func, unpack_func)
 
         if pack_func is None and args is not None:
             raise TypeError("non-null args with null pack_func")
@@ -279,20 +276,31 @@ class Client(object):
 # Record-Marking standard support
 
 
+def _sendto(sock, data, address):
+    """
+    loops calling sock.sendto() until all data is sent.
+    """
+    ptr = 0
+    while data[ptr:]:
+        ptr += sock.sendto(data[ptr:], address)
+
+
+# XXX sendfrag() should have been deleted when it was inlined into
+# _sendrecord() during refactoring
 def sendfrag(sock, last, frag):
     x = len(frag)
     if last:
         x = x | 0x80000000
     header = struct.pack(">I", x)
-    sock.send(header + frag)
+    sock.sendall(header + frag)
 
 
 def _sendrecord(sock, record, fragsize=None, timeout=None):
-    logger.debug("Sending record through %s: %r", sock, record)
+    LOGGER.debug("Sending record through %s: %r", sock, record)
     if timeout is not None:
         r, w, x = select.select([], [sock], [], timeout)
         if sock not in w:
-            msg = "socket.timeout: The instrument seems to have stopped " "responding."
+            msg = "socket.timeout: The instrument seems to have stopped responding."
             raise socket.timeout(msg)
 
     last = False
@@ -306,12 +314,11 @@ def _sendrecord(sock, record, fragsize=None, timeout=None):
         if last:
             fragsize = fragsize | 0x80000000
         header = struct.pack(">I", fragsize)
-        sock.send(header + record[:fragsize])
+        sock.sendall(header + record[:fragsize])
         record = record[fragsize:]
 
 
 def _recvrecord(sock, timeout, read_fun=None, min_packages=0):
-
     record = bytearray()
     buffer = bytearray()
     if not read_fun:
@@ -323,7 +330,7 @@ def _recvrecord(sock, timeout, read_fun=None, min_packages=0):
     packages_received = 0
 
     if min_packages != 0:
-        logger.debug("Start receiving at least %i packages" % min_packages)
+        LOGGER.debug("Start receiving at least %i packages" % min_packages)
 
     # minimum is in interval 1 - 100ms based on timeout or for infinite it is
     # 1 sec
@@ -340,7 +347,6 @@ def _recvrecord(sock, timeout, read_fun=None, min_packages=0):
     # time, when loop shall finish
     finish_time = time.time() + timeout if timeout is not None else 0
     while True:
-
         # if more data for the current fragment is needed, use select
         # to wait for read ready, max `select_timeout` seconds
         if len(buffer) < exp_length:
@@ -349,11 +355,11 @@ def _recvrecord(sock, timeout, read_fun=None, min_packages=0):
             if sock in r:
                 read_data = read_fun(exp_length)
                 buffer.extend(read_data)
-                logger.debug("received %r" % read_data)
+                LOGGER.debug("received %r" % read_data)
             # Timeout was reached
             if not read_data:  # no response or empty response
                 if timeout is not None and time.time() >= finish_time:
-                    logger.debug(
+                    LOGGER.debug(
                         (
                             "Time out encountered in %s."
                             "Already receieved %d bytes. Last fragment is %d "
@@ -370,7 +376,7 @@ def _recvrecord(sock, timeout, read_fun=None, min_packages=0):
                     )
                     raise socket.timeout(msg)
                 elif min_packages != 0 and packages_received >= min_packages:
-                    logger.debug(
+                    LOGGER.debug(
                         "Stop receiving after %i of %i requested packages. Received record through %s: %r",
                         packages_received,
                         min_packages,
@@ -398,7 +404,7 @@ def _recvrecord(sock, timeout, read_fun=None, min_packages=0):
                 record.extend(buffer[:exp_length])
                 buffer = buffer[exp_length:]
                 if last:
-                    logger.debug("Received record through %s: %r", sock, record)
+                    LOGGER.debug("Received record through %s: %r", sock, record)
                     return bytes(record)
                 else:
                     wait_header = True
@@ -432,6 +438,7 @@ def _connect(sock, host, port, timeout=0):
 
         if time.time() >= finish_time:
             # reached timeout
+            sock.close()
             return False
 
         # `select_timout` decreased to 50% of previous or min_select_timeout
@@ -443,7 +450,8 @@ class RawTCPClient(Client):
 
     def __init__(self, host, prog, vers, port, open_timeout=5000):
         Client.__init__(self, host, prog, vers, port)
-        self.connect((open_timeout / 1000.0) + 1.0)
+        open_timeout = open_timeout if open_timeout is not None else 5000
+        self.connect(1e-3 * open_timeout)
         # self.timeout defaults higher than the default 2 second VISA timeout,
         # ensuring that VISA timeouts take precedence.
         self.timeout = 4.0
@@ -472,7 +480,7 @@ class RawTCPClient(Client):
         return super(RawTCPClient, self).make_call(proc, args, pack_func, unpack_func)
 
     def connect(self, timeout=5.0):
-        logger.debug(
+        LOGGER.debug(
             "RawTCPClient: connecting to socket at (%s, %s)", self.host, self.port
         )
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -480,7 +488,7 @@ class RawTCPClient(Client):
             raise RPCError("can't connect to server")
 
     def close(self):
-        logger.debug("RawTCPClient: closing socket")
+        LOGGER.debug("RawTCPClient: closing socket")
         self.sock.close()
 
     def do_call(self):
@@ -490,19 +498,29 @@ class RawTCPClient(Client):
 
         try:
             min_packages = int(self.packer.proc == 3)
-            logger.debug("RawTCPClient: procedure type %i" % self.packer.proc)
+            LOGGER.debug("RawTCPClient: procedure type %i" % self.packer.proc)
             # if the command is get_port, we only expect one package.
             # This is a workaround for misbehaving instruments.
         except AttributeError:
             min_packages = 0
-        reply = _recvrecord(self.sock, self.timeout, min_packages=min_packages)
-        u = self.unpacker
-        u.reset(reply)
-        xid, verf = u.unpack_replyheader()
-        if xid != self.lastxid:
-            # Can't really happen since this is TCP...
-            msg = "wrong xid in reply {0} instead of {1}"
-            raise RPCError(msg.format(xid, self.lastxid))
+
+        while True:
+            reply = _recvrecord(self.sock, self.timeout, min_packages=min_packages)
+            u = self.unpacker
+            u.reset(reply)
+            xid, verf = u.unpack_replyheader()
+            if xid == self.lastxid:
+                # xid matches, we're done
+                return
+            elif xid < self.lastxid:
+                # Stale data in buffer due to interruption
+                # Discard and fetch another record
+                continue
+            else:
+                # xid larger than expected - packet from the future?
+                raise RPCError(
+                    "wrong xid in reply %r instead of %r" % (xid, self.lastxid)
+                )
 
 
 class RawUDPClient(Client):
@@ -513,19 +531,19 @@ class RawUDPClient(Client):
         self.connect()
 
     def connect(self):
-        logger.debug(
+        LOGGER.debug(
             "RawTCPClient: connecting to socket at (%s, %s)", self.host, self.port
         )
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.connect((self.host, self.port))
 
     def close(self):
-        logger.debug("RawTCPClient: closing socket")
+        LOGGER.debug("RawTCPClient: closing socket")
         self.sock.close()
 
     def do_call(self):
         call = self.packer.get_buf()
-        self.sock.send(call)
+        self.sock.sendall(call)
 
         BUFSIZE = 8192  # Max UDP buffer size
         timeout = 1
@@ -540,7 +558,7 @@ class RawUDPClient(Client):
                     raise RPCError("timeout")
                 if timeout < 25:
                     timeout = timeout * 2
-                self.sock.send(call)
+                self.sock.sendall(call)
                 continue
             reply = self.sock.recv(BUFSIZE)
             u = self.unpacker
@@ -576,7 +594,7 @@ class RawBroadcastUDPClient(RawUDPClient):
         if pack_func:
             pack_func(args)
         call = self.packer.get_buf()
-        self.sock.sendto(call, (self.host, self.port))
+        _sendto(self.sock, call, (self.host, self.port))
 
         BUFSIZE = 8192  # Max UDP buffer size (for reply)
         replies = []
@@ -596,6 +614,52 @@ class RawBroadcastUDPClient(RawUDPClient):
             if self.sock not in r:
                 break
             reply, fromaddr = self.sock.recvfrom(BUFSIZE)
+            u = self.unpacker
+            u.reset(reply)
+            xid, verf = u.unpack_replyheader()
+            if xid != self.lastxid:
+                continue
+            reply = unpack_func()
+            self.unpacker.done()
+            replies.append((reply, fromaddr))
+            if self.reply_handler:
+                self.reply_handler(reply, fromaddr)
+        return replies
+
+    def send_call(self, proc, args, pack_func):
+        if pack_func is None and args is not None:
+            raise TypeError("non-null args with null pack_func")
+        self.start_call(proc)
+        if pack_func:
+            pack_func(args)
+        call = self.packer.get_buf()
+        try:
+            _sendto(self.sock, call, (self.host, self.port))
+        except OSError as exc:
+            raise RPCError("unable to send broadcast") from exc
+
+    def recv_call(self, unpack_func):
+        BUFSIZE = 8192  # Max UDP buffer size (for reply)
+        replies = []
+        if unpack_func is None:
+
+            def dummy():
+                pass
+
+            unpack_func = dummy
+        while 1:
+            r, w, x = [self.sock], [], []
+            if select:
+                if self.timeout is None:
+                    r, w, x = select.select(r, w, x)
+                else:
+                    r, w, x = select.select(r, w, x, self.timeout)
+            if self.sock not in r:
+                break
+            try:
+                reply, fromaddr = self.sock.recvfrom(BUFSIZE)
+            except OSError as exc:
+                raise RPCError("unable to recieve broadcast") from exc
             u = self.unpacker
             u.reset(reply)
             xid, verf = u.unpack_replyheader()
@@ -705,6 +769,18 @@ class PartialPortMapperClient(object):
             PortMapperVersion.get_port,
             mapping,
             self.packer.pack_mapping,
+            self.unpacker.unpack_uint,
+        )
+
+    def send_port(self, mapping):
+        return self.send_call(
+            PortMapperVersion.get_port,
+            mapping,
+            self.packer.pack_mapping,
+        )
+
+    def recv_port(self, mapping):
+        return self.recv_call(
             self.unpacker.unpack_uint,
         )
 
@@ -929,7 +1005,7 @@ class TCPServer(Server):
             except EOFError:
                 break
             except socket.error:
-                logger.exception("socket error: %r", sys.exc_info()[0])
+                LOGGER.exception("socket error: %r", sys.exc_info()[0])
                 break
             reply = self.handle(call)
             if reply is not None:
@@ -983,4 +1059,4 @@ class UDPServer(Server):
         call, host_port = self.sock.recvfrom(8192)
         reply = self.handle(call)
         if reply is not None:
-            self.sock.sendto(reply, host_port)
+            _sendto(self.sock, reply, host_port)

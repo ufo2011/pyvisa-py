@@ -15,8 +15,8 @@ and some well developed, easy to deploy and cross platform libraries.
 You can select the PyVISA-py backend using **@py** when instantiating the
 visa Resource Manager:
 
-    >>> import visa
-    >>> rm = visa.ResourceManager('@py')
+    >>> import pyvisa
+    >>> rm = pyvisa.ResourceManager('@py')
     >>> rm.list_resources()
     ('USB0::0x1AB1::0x0588::DS1K00005888::INSTR')
     >>> inst = rm.open_resource('USB0::0x1AB1::0x0588::DS1K00005888::INSTR')
@@ -34,6 +34,16 @@ Currently Pyvisa-py support the following resources:
 - ASRL INSTR
 - USB INSTR
 - USB RAW
+
+    Note:
+    ASRL INSTR supports also URL Handlers like 
+    
+    - loop:// --> ASLRloop://::INSTR
+    - socket:// --> ASRLsocket://::INSTR
+
+    These entries will not be listed during the device discovery `rm.list_resources()`.
+    For further details see https://pyserial.readthedocs.io/en/latest/url_handlers.html
+    
 
 You can report a problem or ask for features in the `issue tracker`_.
 Or get the code in GitHub_.

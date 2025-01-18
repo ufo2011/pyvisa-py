@@ -1,5 +1,4 @@
-black
-flake8
-isort
+ruff
+pytest
 sphinx
 sphinx-rtd-theme
